@@ -40,7 +40,7 @@ Build a Python GUI app with Playwright.
 5. Run this command from the project root:
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile --windowed --name "E-Samarth-Marks-Entry-Assistant" --icon "app.ico" --hidden-import playwright.sync_api --add-data "sample_data;sample_data" app.py
+pyinstaller --noconfirm --clean --onefile --windowed --name "E-Samarth-Marks-Entry-Assistant" --icon "icon.ico" --hidden-import playwright.sync_api  app.py
 ```
 
 Generated executable:

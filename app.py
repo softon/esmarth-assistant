@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, TimeoutError, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, TimeoutError, sync_playwright
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -55,6 +56,8 @@ class MainWindow(QMainWindow):
 
         self.df: Optional[pd.DataFrame] = None
         self.records: list[MarkRecord] = []
+        self.stop_requested = False
+        self.is_running = False
 
         self._build_ui()
 
@@ -83,6 +86,8 @@ class MainWindow(QMainWindow):
 
         self.seat_col_combo = QComboBox()
         self.marks_col_combo = QComboBox()
+        self.seat_col_combo.currentIndexChanged.connect(self._on_column_selection_changed)
+        self.marks_col_combo.currentIndexChanged.connect(self._on_column_selection_changed)
 
         source_layout.addWidget(QLabel("Seat Number Column:"), 1, 0)
         source_layout.addWidget(self.seat_col_combo, 1, 1)
@@ -127,8 +132,21 @@ class MainWindow(QMainWindow):
         run_box = QGroupBox("3) Execute")
         run_layout = QHBoxLayout(run_box)
 
-        start_btn = QPushButton("Start Entry")
-        start_btn.clicked.connect(self._on_start_entry)
+        self.enter_marks_checkbox = QCheckBox("Enter marks")
+        self.enter_marks_checkbox.setChecked(True)
+
+        self.mark_present_checkbox = QCheckBox("Mark present")
+        self.mark_present_checkbox.setChecked(True)
+
+        self.click_save_checkbox = QCheckBox("Click save")
+        self.click_save_checkbox.setChecked(True)
+
+        self.start_btn = QPushButton("Start Entry")
+        self.start_btn.clicked.connect(self._on_start_entry)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._on_stop_entry)
+        self.stop_btn.setEnabled(False)
 
         self.progress = QProgressBar()
         self.progress.setMinimum(0)
@@ -136,7 +154,11 @@ class MainWindow(QMainWindow):
 
         self.progress_label = QLabel("Progress: 0/0")
 
-        run_layout.addWidget(start_btn)
+        run_layout.addWidget(self.enter_marks_checkbox)
+        run_layout.addWidget(self.mark_present_checkbox)
+        run_layout.addWidget(self.click_save_checkbox)
+        run_layout.addWidget(self.start_btn)
+        run_layout.addWidget(self.stop_btn)
         run_layout.addWidget(self.progress, 1)
         run_layout.addWidget(self.progress_label)
 
@@ -214,22 +236,31 @@ class MainWindow(QMainWindow):
                     return idx
         return None
 
+    def _on_column_selection_changed(self, _index: int) -> None:
+        if self.df is None:
+            return
+        self._build_records_from_selection()
+
     def _build_records_from_selection(self) -> None:
         if self.df is None:
             return
 
-        seat_col = self.seat_col_combo.currentText()
-        marks_col = self.marks_col_combo.currentText()
-        if not seat_col or not marks_col:
+        seat_col_idx = self.seat_col_combo.currentIndex()
+        marks_col_idx = self.marks_col_combo.currentIndex()
+        if seat_col_idx < 0 or marks_col_idx < 0:
             return
 
-        subset = self.df[[seat_col, marks_col]].copy()
-        subset = subset.dropna(subset=[seat_col])
+        # Use positional indexing so duplicate column names do not return Series objects.
+        subset = self.df.iloc[:, [seat_col_idx, marks_col_idx]].copy()
+        seat_subset_col = subset.columns[0]
+        marks_subset_col = subset.columns[1]
+        subset = subset.dropna(subset=[seat_subset_col])
 
         self.records = []
         for _, row in subset.iterrows():
-            seat = self._clean_str(row[seat_col])
-            marks = self._clean_str(row[marks_col])
+            # Access by position to avoid ambiguous Series when labels are duplicated.
+            seat = self._clean_str(row.iloc[0])
+            marks = self._clean_str(row.iloc[1])
             if seat:
                 self.records.append(MarkRecord(seat_number=seat, marks=marks, status="PENDING"))
 
@@ -473,10 +504,33 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 time.sleep(0.05)
 
-        self._error("Timed out waiting for selection. Try again.")
+        self._disarm_picker()
+        self._log("Selection timed out. Click Select Table/Select Seat Column again when ready.")
         return None
 
+    def _disarm_picker(self) -> None:
+        if self.page is None:
+            return
+        try:
+            self.page.evaluate(
+                """
+                () => {
+                    const old = window.__esamarthPicker;
+                    if (old && old.cleanup) {
+                        old.cleanup();
+                    }
+                }
+                """
+            )
+        except Exception:
+            pass
+
     def _on_start_entry(self) -> None:
+        if self.is_running:
+            return
+
+        self._disarm_picker()
+
         if self.df is None:
             self._error("Load source data first.")
             return
@@ -500,29 +554,67 @@ class MainWindow(QMainWindow):
 
         marks_col_idx = self.marks_col_index_spin.value()
         delay_ms = self.delay_spin.value()
+        do_enter_marks = self.enter_marks_checkbox.isChecked()
+        do_mark_present = self.mark_present_checkbox.isChecked()
+        do_click_save = self.click_save_checkbox.isChecked()
 
         total = len(self.records)
         self.progress.setMaximum(total)
+        self.stop_requested = False
+        self.is_running = True
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
 
         done = 0
-        for idx, record in enumerate(self.records):
-            QApplication.processEvents()
+        try:
+            for idx, record in enumerate(self.records):
+                QApplication.processEvents()
 
-            try:
-                success = self._process_single_record(record, marks_col_idx)
-                record.status = "DONE" if success else "NOT FOUND"
-            except Exception as exc:
-                record.status = f"ERROR: {exc}"
+                if self.stop_requested:
+                    self._log("Stop requested. Halting current run.")
+                    break
 
-            self.table_widget.setItem(idx, 2, QTableWidgetItem(record.status))
-            done += 1
-            self.progress.setValue(done)
-            self.progress_label.setText(f"Progress: {done}/{total}")
-            time.sleep(delay_ms / 1000)
+                try:
+                    success = self._process_single_record(
+                        record,
+                        marks_col_idx,
+                        do_enter_marks,
+                        do_mark_present,
+                        do_click_save,
+                    )
+                    record.status = "DONE" if success else "NOT FOUND"
+                except Exception as exc:
+                    record.status = f"ERROR: {exc}"
 
-        self._log("Data entry run completed.")
+                self.table_widget.setItem(idx, 2, QTableWidgetItem(record.status))
+                done += 1
+                self.progress.setValue(done)
+                self.progress_label.setText(f"Progress: {done}/{total}")
+                time.sleep(delay_ms / 1000)
 
-    def _process_single_record(self, record: MarkRecord, marks_col_idx: int) -> bool:
+            if self.stop_requested:
+                self.progress_label.setText(f"Stopped: {done}/{total}")
+            else:
+                self._log("Data entry run completed.")
+        finally:
+            self._disarm_picker()
+            self.is_running = False
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+
+    def _on_stop_entry(self) -> None:
+        if not self.is_running:
+            return
+        self.stop_requested = True
+
+    def _process_single_record(
+        self,
+        record: MarkRecord,
+        marks_col_idx: int,
+        do_enter_marks: bool,
+        do_mark_present: bool,
+        do_click_save: bool,
+    ) -> bool:
         assert self.page is not None
 
         rows = self.page.locator(f"{self.table_selector} tr")
@@ -543,24 +635,29 @@ class MainWindow(QMainWindow):
             if cell_text != seat_key:
                 continue
 
-            marks_input = row.locator(f"td:nth-child({marks_col_idx}) input[type='text']").first
-            if marks_input.count() == 0:
-                return False
+            if do_enter_marks:
+                marks_input = row.locator(f"td:nth-child({marks_col_idx}) input[type='text']").first
+                if marks_input.count() == 0:
+                    return False
 
-            marks_input.click(timeout=1000)
-            marks_input.fill(record.marks)
+                marks_input.click(timeout=1000)
+                marks_input.fill(record.marks)
 
-            present_checkbox = row.locator(
-                f"td:nth-child({marks_col_idx}) input.component-status[value='PRESENT']"
-            ).first
-            if present_checkbox.count() > 0:
-                present_checkbox.check(force=True)
+            if do_mark_present:
+                present_checkbox = row.locator(
+                    f"td:nth-child({marks_col_idx}) input.component-status[value='PRESENT']"
+                ).first
+                if present_checkbox.count() == 0:
+                    return False
+                if not self._ensure_checkbox_checked(present_checkbox):
+                    return False
 
-            save_button = row.locator("button.savefunction").first
-            if save_button.count() > 0:
-                save_button.click(timeout=1000)
-            else:
-                return False
+            if do_click_save:
+                save_button = row.locator("button.savefunction").first
+                if save_button.count() > 0:
+                    save_button.click(timeout=1000)
+                else:
+                    return False
 
             self.page.wait_for_timeout(220)
             return True
@@ -574,7 +671,46 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 return
 
+    def _ensure_checkbox_checked(self, checkbox: Locator) -> bool:
+        try:
+            if checkbox.is_checked(timeout=500):
+                return True
+        except Exception:
+            pass
+
+        for action in (
+            lambda: checkbox.check(force=True, timeout=1200),
+            lambda: checkbox.click(force=True, timeout=1200),
+        ):
+            try:
+                action()
+                if checkbox.is_checked(timeout=500):
+                    return True
+            except Exception:
+                continue
+
+        # Some rows block synthetic click; force set and dispatch events as fallback.
+        try:
+            checkbox.evaluate(
+                """
+                (el) => {
+                    el.checked = true;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                """
+            )
+            return checkbox.is_checked(timeout=500)
+        except Exception:
+            return False
+
     def _clean_str(self, value) -> str:
+        # Duplicate labels can occasionally yield Series values; collapse to first scalar.
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return ""
+            value = value.iloc[0]
+
         if pd.isna(value):
             return ""
         text = str(value).strip()

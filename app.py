@@ -114,9 +114,9 @@ class MainWindow(QMainWindow):
         self.marks_col_index_spin.setValue(5)
 
         self.delay_spin = QSpinBox()
-        self.delay_spin.setMinimum(100)
+        self.delay_spin.setMinimum(0)
         self.delay_spin.setMaximum(5000)
-        self.delay_spin.setValue(450)
+        self.delay_spin.setValue(0)
         self.delay_spin.setSuffix(" ms")
 
         browser_layout.addWidget(launch_btn, 0, 0)
@@ -590,7 +590,9 @@ class MainWindow(QMainWindow):
                 done += 1
                 self.progress.setValue(done)
                 self.progress_label.setText(f"Progress: {done}/{total}")
-                time.sleep(delay_ms / 1000)
+
+                if delay_ms > 0 and not self.stop_requested:
+                    time.sleep(delay_ms / 1000)
 
             if self.stop_requested:
                 self.progress_label.setText(f"Stopped: {done}/{total}")
@@ -654,12 +656,109 @@ class MainWindow(QMainWindow):
 
             if do_click_save:
                 save_button = row.locator("button.savefunction").first
-                if save_button.count() > 0:
-                    save_button.click(timeout=1000)
-                else:
+                if save_button.count() == 0:
                     return False
 
-            self.page.wait_for_timeout(220)
+                if not self._click_save_and_wait(row, save_button):
+                    return False
+
+            self.page.wait_for_timeout(120)
+            return True
+
+        return False
+
+    def _click_save_and_wait(self, row: Locator, save_button: Locator) -> bool:
+        assert self.page is not None
+
+        comp_id = None
+        try:
+            comp_id = save_button.get_attribute("data-comp", timeout=700)
+        except Exception:
+            comp_id = None
+
+        result_selector = f"#result-{comp_id}" if comp_id else None
+        before_text = ""
+        before_html = ""
+        if result_selector:
+            try:
+                before_text = self.page.eval_on_selector(result_selector, "el => (el.innerText || '').trim()")
+                before_html = self.page.eval_on_selector(result_selector, "el => (el.innerHTML || '').trim()")
+            except Exception:
+                before_text = ""
+                before_html = ""
+
+        ajax_seen = False
+        try:
+            with self.page.expect_response(
+                lambda resp: self._is_row_save_response(resp.url, resp.request.method, resp.request.resource_type, resp.request.post_data, comp_id),
+                timeout=12000,
+            ):
+                save_button.click(timeout=1200)
+            ajax_seen = True
+        except TimeoutError:
+            self._log("Save response wait timed out, trying DOM result fallback.")
+        except Exception:
+            try:
+                save_button.click(timeout=1200)
+            except Exception:
+                return False
+
+        if ajax_seen:
+            if result_selector:
+                self._wait_for_result_change(result_selector, before_text, before_html, timeout_ms=5000)
+            return True
+
+        if result_selector:
+            return self._wait_for_result_change(result_selector, before_text, before_html, timeout_ms=12000)
+
+        self.page.wait_for_timeout(250)
+        return True
+
+    def _wait_for_result_change(self, selector: str, before_text: str, before_html: str, timeout_ms: int) -> bool:
+        assert self.page is not None
+
+        try:
+            self.page.wait_for_function(
+                """
+                ({ selector, beforeText, beforeHtml }) => {
+                    const el = document.querySelector(selector);
+                    if (!el) return false;
+                    const text = (el.innerText || '').trim();
+                    const html = (el.innerHTML || '').trim();
+
+                    if (text !== beforeText || html !== beforeHtml) return true;
+                    return text.length > 0 || html.length > 0;
+                }
+                """,
+                arg={"selector": selector, "beforeText": before_text or "", "beforeHtml": before_html or ""},
+                timeout=timeout_ms,
+            )
+            return True
+        except TimeoutError:
+            return False
+        except Exception:
+            return False
+
+    def _is_row_save_response(
+        self,
+        url: str,
+        method: str,
+        resource_type: str,
+        post_data: Optional[str],
+        comp_id: Optional[str],
+    ) -> bool:
+        if resource_type not in {"xhr", "fetch"}:
+            return False
+
+        method_u = (method or "").upper()
+        if method_u not in {"GET", "POST"}:
+            return False
+
+        url_l = (url or "").lower()
+        if "marks" in url_l and ("save" in url_l or "entry" in url_l or "meou" in url_l):
+            return True
+
+        if comp_id and post_data and comp_id in post_data:
             return True
 
         return False

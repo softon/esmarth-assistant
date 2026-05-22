@@ -52,7 +52,6 @@ class MainWindow(QMainWindow):
 
         self._selection_queue: queue.Queue[dict] = queue.Queue()
         self.table_selector: str = ""
-        self.seat_column_index: Optional[int] = None
 
         self.df: Optional[pd.DataFrame] = None
         self.records: list[MarkRecord] = []
@@ -105,8 +104,10 @@ class MainWindow(QMainWindow):
         select_table_btn = QPushButton("Select Table")
         select_table_btn.clicked.connect(self._on_select_table)
 
-        select_seat_btn = QPushButton("Select Seat Column")
-        select_seat_btn.clicked.connect(self._on_select_seat_column)
+        self.seat_col_index_spin = QSpinBox()
+        self.seat_col_index_spin.setMinimum(1)
+        self.seat_col_index_spin.setMaximum(100)
+        self.seat_col_index_spin.setValue(3)
 
         self.marks_col_index_spin = QSpinBox()
         self.marks_col_index_spin.setMinimum(1)
@@ -121,11 +122,12 @@ class MainWindow(QMainWindow):
 
         browser_layout.addWidget(launch_btn, 0, 0)
         browser_layout.addWidget(select_table_btn, 0, 1)
-        browser_layout.addWidget(select_seat_btn, 0, 2)
-        browser_layout.addWidget(QLabel("Marks Column Index in Portal:"), 1, 0)
-        browser_layout.addWidget(self.marks_col_index_spin, 1, 1)
-        browser_layout.addWidget(QLabel("Delay between rows:"), 1, 2)
-        browser_layout.addWidget(self.delay_spin, 1, 3)
+        browser_layout.addWidget(QLabel("Seat Number Column Index in Portal:"), 1, 0)
+        browser_layout.addWidget(self.seat_col_index_spin, 1, 1)
+        browser_layout.addWidget(QLabel("Marks Column Index in Portal:"), 1, 2)
+        browser_layout.addWidget(self.marks_col_index_spin, 1, 3)
+        browser_layout.addWidget(QLabel("Delay between rows:"), 2, 0)
+        browser_layout.addWidget(self.delay_spin, 2, 1)
 
         layout.addWidget(browser_box)
 
@@ -201,9 +203,11 @@ class MainWindow(QMainWindow):
 
         try:
             if path.suffix.lower() == ".csv":
-                self.df = pd.read_csv(path)
+                # Preserve source values as text and avoid automatic numeric coercion.
+                self.df = pd.read_csv(path, dtype=str, keep_default_na=False)
             else:
-                self.df = pd.read_excel(path)
+                # Preserve source values as text and avoid automatic numeric coercion.
+                self.df = pd.read_excel(path, dtype=str, keep_default_na=False)
         except Exception as exc:
             self._error(f"Failed to read file: {exc}")
             return
@@ -347,22 +351,6 @@ class MainWindow(QMainWindow):
         else:
             self._error("Could not capture table selector.")
 
-    def _on_select_seat_column(self) -> None:
-        result = self._pick_from_page("column")
-        if not result:
-            return
-
-        column_index = result.get("columnIndex")
-        table_selector = result.get("tableSelector", "")
-
-        if table_selector:
-            self.table_selector = table_selector
-        if isinstance(column_index, int):
-            self.seat_column_index = column_index
-            self._log(f"Selected seat-number column index: {column_index}")
-        else:
-            self._error("Could not capture seat column index.")
-
     def _pick_from_page(self, mode: str) -> Optional[dict]:
         if self.page is None:
             self._error("Open browser first.")
@@ -505,7 +493,7 @@ class MainWindow(QMainWindow):
                 time.sleep(0.05)
 
         self._disarm_picker()
-        self._log("Selection timed out. Click Select Table/Select Seat Column again when ready.")
+        self._log("Selection timed out. Click Select Table again when ready.")
         return None
 
     def _disarm_picker(self) -> None:
@@ -548,10 +536,7 @@ class MainWindow(QMainWindow):
             self._error("Select the portal table first.")
             return
 
-        if self.seat_column_index is None:
-            self._error("Select the seat-number column first.")
-            return
-
+        seat_col_idx = self.seat_col_index_spin.value()
         marks_col_idx = self.marks_col_index_spin.value()
         delay_ms = self.delay_spin.value()
         do_enter_marks = self.enter_marks_checkbox.isChecked()
@@ -577,6 +562,7 @@ class MainWindow(QMainWindow):
                 try:
                     success = self._process_single_record(
                         record,
+                        seat_col_idx,
                         marks_col_idx,
                         do_enter_marks,
                         do_mark_present,
@@ -612,6 +598,7 @@ class MainWindow(QMainWindow):
     def _process_single_record(
         self,
         record: MarkRecord,
+        seat_col_idx: int,
         marks_col_idx: int,
         do_enter_marks: bool,
         do_mark_present: bool,
@@ -625,7 +612,7 @@ class MainWindow(QMainWindow):
         seat_key = self._norm(record.seat_number)
         for row_idx in range(row_count):
             row = rows.nth(row_idx)
-            seat_cell = row.locator(f"td:nth-child({self.seat_column_index})").first
+            seat_cell = row.locator(f"td:nth-child({seat_col_idx})").first
             if seat_cell.count() == 0:
                 continue
 
@@ -812,6 +799,13 @@ class MainWindow(QMainWindow):
 
         if pd.isna(value):
             return ""
+
+        # Guard against occasional numeric coercion (e.g., 123.0 for seat numbers).
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return format(value, "f").rstrip("0").rstrip(".")
+
         text = str(value).strip()
         return text
 

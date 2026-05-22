@@ -6,7 +6,7 @@ The e-samarth web portal marks entry assistant. Teachers have excel sheet of sea
 - The the Teachers clicks a button in the app to open chrome browser with debugging 
 - The teachers logs in and reaches the page where the data entry is to be done.
 - The teacher clicks the button to select the table where data entry is to be performed
-- The teacher selects the column where seat number is present
+- The teacher sets `Seat Column Index in Portal` (default `3`) and `Marks Column Index in Portal` (default `5`)
 - Then clicks the Start button on the app to starts data entry
 - Progress bar show the status
 - The app has a tabular list of data imported from the excel and an additional column with the status of the data entry like PENDING, DONE, NOT FOUND
@@ -57,7 +57,7 @@ Notes:
 3. Click `Open Chromium (Debug)` and login to the e-samarth portal.
 4. Navigate to the marks entry page.
 5. Click `Select Table`, then click the marks table in the portal.
-6. Click `Select Seat Column`, then click a seat number cell in that table.
+6. Keep `Seat Column Index in Portal` as `3` unless your page layout differs.
 7. Keep `Marks Column Index in Portal` as `5` unless your page layout differs.
 8. Click `Start Entry`.
 
